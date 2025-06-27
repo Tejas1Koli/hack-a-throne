@@ -1,7 +1,8 @@
 import logging
 import sys
 from pathlib import Path
-from pydantic import BaseSettings, Field
+from pydantic_settings import BaseSettings
+from pydantic import Field
 from typing import Optional, Dict, Any
 
 # Logging configuration
@@ -80,7 +81,8 @@ class Settings(BaseSettings):
     # OpenRouter Configuration
     OPENROUTER_API_KEY: str
     OPENROUTER_URL: str = "https://openrouter.ai/api/v1/chat/completions"
-    OPENROUTER_MODEL: str = "deepseek/deepseek-r1-0528-qwen3-8b:free"
+    OPENROUTER_MODEL: str = "google/gemma-3n-e4b-it:free"
+    OPENROUTER_VERIFY_SSL: bool = True
     
     # API Configuration
     DEBUG: bool = False

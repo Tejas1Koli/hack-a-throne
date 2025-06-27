@@ -22,18 +22,38 @@ class OpenRouterAnalyzer(BaseClauseAnalyzer):
             self.api_key = settings.OPENROUTER_API_KEY
             self.api_url = settings.OPENROUTER_URL
             self.model = settings.OPENROUTER_MODEL
-            
+            # Debug: API key presence, prefix, and length
+            logger.info(f"[DEBUG] API Key loaded: {'set' if self.api_key else 'NOT set'}")
+            if self.api_key:
+                logger.info(f"[DEBUG] API Key prefix: {self.api_key[:8]}")
+                logger.info(f"[DEBUG] API Key length: {len(self.api_key)}")
+            # Get SSL verification setting, default to True if not set
+            self.verify_ssl = getattr(settings, 'OPENROUTER_VERIFY_SSL', True)
+            logger.info(f"[DEBUG] SSL verification: {'enabled' if self.verify_ssl else 'disabled'}")
             if not self.api_key:
                 error_msg = "OpenRouter API key is not configured"
                 logger.error(error_msg)
                 raise ValueError(error_msg)
-                
             logger.info(f"OpenRouterAnalyzer initialized with model: {self.model}")
-            
+            # Create a persistent client with connection pooling
+            self.client = httpx.AsyncClient(
+                timeout=60.0,
+                verify=self.verify_ssl,
+                limits=httpx.Limits(
+                    max_keepalive_connections=5,
+                    max_connections=10
+                )
+            )
         except Exception as e:
             logger.error(f"Failed to initialize OpenRouterAnalyzer: {str(e)}")
             logger.error(traceback.format_exc())
             raise
+            
+    async def __aenter__(self):
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.client.aclose()
     
     async def analyze_clause(self, clause: str) -> Dict[str, Any]:
         """
@@ -49,40 +69,53 @@ class OpenRouterAnalyzer(BaseClauseAnalyzer):
         logger.debug(f"Analyzing clause: {clause[:100]}...")
         start_time = time.time()
         
+        # Ensure the client is still connected
+        if self.client.is_closed:
+            logger.warning("HTTP client was closed, recreating...")
+            self.client = httpx.AsyncClient(verify=self.verify_ssl)
+        
         try:
             prompt = self._build_prompt(clause)
             logger.debug("Built prompt for OpenRouter API")
             
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Referer": "http://localhost:8001",  # Correct header name for OpenRouter
+                "X-Title": "Legal Document Analyzer"  # Optional: Identify your app
             }
-            
+            # Debug: Log headers with redacted API key
+            redacted_headers = {k: (v[:8] + '...' if k == 'Authorization' else v) for k, v in headers.items()}
+            logger.info(f"[DEBUG] Request headers: {redacted_headers}")
             payload = {
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3
             }
-            
+            logger.info(f"[DEBUG] Request payload: {json.dumps(payload)}")
             logger.debug(f"Sending request to OpenRouter API (model: {self.model})")
-            
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                response = await self.client.post(
+                    self.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=60.0
+                )
+                response_time = time.time() - start_time
+                logger.debug(f"OpenRouter API response status: {response.status_code}")
+                logger.info(f"[DEBUG] Response status: {response.status_code}")
+                logger.info(f"[DEBUG] Response headers: {dict(response.headers)}")
+                logger.info(f"[DEBUG] Response text: {response.text}")
+                response.raise_for_status()
+                
+                # Get the raw response text first for debugging
+                response_text = response.text
+                logger.info(f"[DEBUG] Raw API response: {response_text}")
+                logger.info(f"[DEBUG] Response headers: {dict(response.headers)}")
+                
                 try:
-                    response = await client.post(
-                        self.api_url,
-                        headers=headers,
-                        json=payload,
-                        timeout=60.0
-                    )
-                    response_time = time.time() - start_time
-                    
-                    logger.debug(f"OpenRouter API response status: {response.status_code}")
-                    logger.debug(f"API response time: {response_time:.2f}s")
-                    
-                    response.raise_for_status()
-                    
                     result = response.json()
-                    logger.debug("Received response from OpenRouter API")
+                    logger.debug("Successfully parsed JSON response")
                     
                     # Log API usage if available
                     if 'usage' in result:
@@ -93,12 +126,18 @@ class OpenRouterAnalyzer(BaseClauseAnalyzer):
                             f"Total tokens: {usage.get('total_tokens', 'N/A')}"
                         )
                     
-                    content = result['choices'][0]['message']['content']
-                    logger.debug(f"Raw API response content: {content[:200]}...")
+                    # Extract content from the response
+                    content = result.get('choices', [{}])[0].get('message', {}).get('content')
+                    if not content:
+                        error_msg = "No content in API response"
+                        logger.error(f"{error_msg}. Full response: {result}")
+                        raise ValueError(error_msg)
+                    
+                    logger.debug(f"Raw API response content: {content}")
                     
                     try:
                         analysis = json.loads(content)
-                        logger.debug("Successfully parsed API response as JSON")
+                        logger.debug("Successfully parsed content as JSON")
                         
                         result = {
                             "clause": clause,
@@ -110,29 +149,37 @@ class OpenRouterAnalyzer(BaseClauseAnalyzer):
                         
                         logger.debug(f"Analysis complete. Risk score: {result['risk_score']}, Type: {result['clause_type']}")
                         return result
-                        
+                    
                     except json.JSONDecodeError as e:
                         error_msg = f"Failed to parse API response as JSON: {str(e)}"
-                        logger.error(error_msg)
-                        logger.error(f"Response content: {content}")
-                        raise ValueError(error_msg) from e
+                        logger.error(f"{error_msg}. Raw response: {response_text}")
+                        logger.error(f"Response headers: {dict(response.headers)}")
+                        raise ValueError(f"{error_msg}. Raw response: {response_text}") from e
                         
-                except httpx.HTTPStatusError as e:
-                    error_msg = f"OpenRouter API request failed with status {e.response.status_code}"
-                    logger.error(error_msg)
-                    logger.error(f"Response: {e.response.text}")
-                    raise
-                    
-                except httpx.TimeoutException:
-                    error_msg = "OpenRouter API request timed out"
-                    logger.error(error_msg)
-                    raise TimeoutError(error_msg) from None
-                    
                 except Exception as e:
-                    error_msg = f"Unexpected error calling OpenRouter API: {str(e)}"
-                    logger.error(error_msg)
-                    logger.error(traceback.format_exc())
-                    raise
+                    error_msg = f"Failed to extract analysis from API response: {str(e)}"
+                    logger.error(f"{error_msg}. Raw response: {response_text}")
+                    logger.error(f"Response headers: {dict(response.headers)}")
+                    if 'content' in locals():
+                        logger.error(f"Response content: {content}")
+                    raise ValueError(f"{error_msg}. Raw response: {response_text}") from e
+                    
+            except httpx.HTTPStatusError as e:
+                error_msg = f"OpenRouter API request failed with status {e.response.status_code}"
+                logger.error(error_msg)
+                logger.error(f"Response: {e.response.text}")
+                raise
+                
+            except httpx.TimeoutException:
+                error_msg = "OpenRouter API request timed out"
+                logger.error(error_msg)
+                raise TimeoutError(error_msg) from None
+                
+            except Exception as e:
+                error_msg = f"Unexpected error calling OpenRouter API: {str(e)}"
+                logger.error(error_msg)
+                logger.error(traceback.format_exc())
+                raise
                     
         except Exception as e:
             logger.error(f"Error in analyze_clause: {str(e)}")
